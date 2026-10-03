@@ -6,26 +6,33 @@ from datetime import datetime
 import aiohttp
 from playwright.async_api import async_playwright
 
-
-# =========================================================
+# ============================================================
 # НАЛАШТУВАННЯ
-# =========================================================
+# ============================================================
 
 SITE_URL = "https://cherga.dmsu.gov.ua/"
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
+# Яку область перевіряти.
+# Можна змінити на потрібну тобі.
+CHECK_REGION = os.getenv(
+    "CHECK_REGION",
+    "Вінницька область"
+)
+
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "15"))
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "45000"))
 
+# Скільки успішних/невдалих перевірок поспіль потрібно
+# для зміни стану.
 SUCCESS_REQUIRED = int(os.getenv("SUCCESS_REQUIRED", "2"))
 FAIL_REQUIRED = int(os.getenv("FAIL_REQUIRED", "2"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
-
-# =========================================================
+# ============================================================
 # LOGGING
-# =========================================================
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,10 +41,9 @@ logging.basicConfig(
 
 logger = logging.getLogger("dmsu-monitor")
 
-
-# =========================================================
+# ============================================================
 # ГЛОБАЛЬНІ ЗМІННІ
-# =========================================================
+# ============================================================
 
 browser = None
 
@@ -50,12 +56,11 @@ last_check_result = None
 last_check_time = None
 
 
-# =========================================================
+# ============================================================
 # TELEGRAM
-# =========================================================
+# ============================================================
 
 async def send_telegram(message, chat_id=None, keyboard=False):
-
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не заданий!")
         return False
@@ -66,52 +71,41 @@ async def send_telegram(message, chat_id=None, keyboard=False):
         logger.error("CHAT_ID не заданий!")
         return False
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     data = {
         "chat_id": target_chat_id,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "disable_web_page_preview": False,
     }
 
-    # Кнопка "Перевірити зараз"
     if keyboard:
-
         data["reply_markup"] = {
-            "keyboard": [
+            "inline_keyboard": [
                 [
                     {
-                        "text": "🔍 Перевірити зараз"
+                        "text": "🚀 ВІДКРИТИ ЕЛЕКТРОННУ ЧЕРГУ",
+                        "url": SITE_URL,
                     }
-                ]
-            ],
-            "resize_keyboard": True,
-            "is_persistent": True,
+                ],
+                [
+                    {
+                        "text": "🔍 Перевірити зараз",
+                        "callback_data": "check",
+                    }
+                ],
+            ]
         }
 
     try:
-
         timeout = aiohttp.ClientTimeout(total=15)
 
-        async with aiohttp.ClientSession(
-            timeout=timeout
-        ) as session:
-
-            async with session.post(
-                url,
-                json=data
-            ) as response:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=data) as response:
 
                 if response.status == 200:
-
-                    logger.info(
-                        "Telegram повідомлення відправлено."
-                    )
-
+                    logger.info("Telegram повідомлення відправлено.")
                     return True
 
                 text = await response.text()
@@ -125,7 +119,6 @@ async def send_telegram(message, chat_id=None, keyboard=False):
                 return False
 
     except Exception as e:
-
         logger.error(
             "Помилка Telegram: %s",
             e,
@@ -134,12 +127,187 @@ async def send_telegram(message, chat_id=None, keyboard=False):
         return False
 
 
-# =========================================================
-# ПЕРЕВІРКА САЙТУ
-# =========================================================
+# ============================================================
+# ДОПОМІЖНІ ФУНКЦІЇ ДЛЯ СЕЛЕКТІВ
+# ============================================================
+
+async def find_region_select(page):
+    """
+    Шукаємо select, який відповідає області.
+    """
+
+    selects = page.locator("select")
+
+    count = await selects.count()
+
+    logger.info(
+        "Знайдено select елементів: %s",
+        count,
+    )
+
+    for i in range(count):
+
+        select = selects.nth(i)
+
+        try:
+            options = await select.locator("option").all_inner_texts()
+
+            options_text = " | ".join(options).lower()
+
+            logger.info(
+                "SELECT #%s: %s",
+                i,
+                options[:10],
+            )
+
+            if (
+                "область" in options_text
+                or "регіон" in options_text
+                or "вінниць" in options_text
+            ):
+                return select
+
+        except Exception:
+            continue
+
+    # Якщо не вдалося визначити — беремо перший select
+    if count > 0:
+        logger.info(
+            "Не вдалося визначити select області. "
+            "Використовую перший."
+        )
+
+        return selects.nth(0)
+
+    return None
+
+
+async def find_department_select(page):
+    """
+    Шукаємо select територіального підрозділу.
+    """
+
+    selects = page.locator("select")
+
+    count = await selects.count()
+
+    for i in range(count):
+
+        select = selects.nth(i)
+
+        try:
+
+            # Перевіряємо aria-label
+            aria = await select.get_attribute("aria-label")
+
+            if aria and (
+                "територ" in aria.lower()
+                or "підрозділ" in aria.lower()
+            ):
+                return select
+
+            # Перевіряємо placeholder
+            placeholder = await select.get_attribute(
+                "placeholder"
+            )
+
+            if placeholder and (
+                "територ" in placeholder.lower()
+                or "підрозділ" in placeholder.lower()
+            ):
+                return select
+
+        except Exception:
+            continue
+
+    # Якщо є мінімум два select —
+    # другий зазвичай є підрозділом.
+    if count >= 2:
+        return selects.nth(1)
+
+    return None
+
+
+async def get_real_options(select):
+    """
+    Повертає реальні доступні опції select,
+    виключаючи службові placeholder-и.
+    """
+
+    if select is None:
+        return []
+
+    try:
+        options = await select.locator("option").evaluate_all(
+            """
+            options => options.map(o => ({
+                text: (o.textContent || '').trim(),
+                value: o.value,
+                disabled: o.disabled
+            }))
+            """
+        )
+
+        real_options = []
+
+        for option in options:
+
+            text = option["text"].strip()
+            value = option["value"].strip()
+
+            if option["disabled"]:
+                continue
+
+            if not text:
+                continue
+
+            text_lower = text.lower()
+
+            # Виключаємо стандартні placeholder-и
+            placeholders = [
+                "оберіть",
+                "обрати",
+                "виберіть",
+                "вибрати",
+                "територіальний підрозділ",
+                "область",
+                "регіон",
+            ]
+
+            if any(
+                p in text_lower
+                for p in placeholders
+            ):
+                continue
+
+            # Порожні значення також не потрібні
+            if not value:
+                continue
+
+            real_options.append(
+                {
+                    "text": text,
+                    "value": value,
+                }
+            )
+
+        return real_options
+
+    except Exception as e:
+
+        logger.warning(
+            "Не вдалося прочитати options: %s",
+            e,
+        )
+
+        return []
+
+
+# ============================================================
+# ОСНОВНА ПЕРЕВІРКА САЙТУ
+# ============================================================
 
 async def check_site():
-
     global browser
 
     if browser is None:
@@ -151,17 +319,16 @@ async def check_site():
         return {
             "working": False,
             "status": None,
-            "indicators": [],
+            "region": CHECK_REGION,
+            "departments": [],
             "error": "Browser не запущений",
         }
 
     page = await browser.new_page(
-
         viewport={
             "width": 1440,
             "height": 900,
         },
-
         user_agent=(
             "Mozilla/5.0 (X11; Linux x86_64) "
             "AppleWebKit/537.36 "
@@ -171,6 +338,19 @@ async def check_site():
     )
 
     try:
+
+        logger.info(
+            "=================================================="
+        )
+
+        logger.info(
+            "Перевірка електронної черги ДМСУ"
+        )
+
+        logger.info(
+            "Область: %s",
+            CHECK_REGION,
+        )
 
         logger.info(
             "Відкриваю %s",
@@ -183,20 +363,13 @@ async def check_site():
             timeout=PAGE_TIMEOUT,
         )
 
-        # -------------------------------------------------
-        # HTTP RESPONSE
-        # -------------------------------------------------
-
         if response is None:
-
-            logger.warning(
-                "Сайт не повернув HTTP response."
-            )
 
             return {
                 "working": False,
                 "status": None,
-                "indicators": [],
+                "region": CHECK_REGION,
+                "departments": [],
                 "error": "HTTP response відсутній",
             }
 
@@ -207,28 +380,17 @@ async def check_site():
             status,
         )
 
-        # -------------------------------------------------
-        # HTTP ERROR
-        # -------------------------------------------------
-
         if status >= 400:
-
-            logger.warning(
-                "HTTP помилка: %s",
-                status,
-            )
 
             return {
                 "working": False,
                 "status": status,
-                "indicators": [],
+                "region": CHECK_REGION,
+                "departments": [],
                 "error": f"HTTP {status}",
             }
 
-        # -------------------------------------------------
-        # ЧЕКАЄМО JAVASCRIPT
-        # -------------------------------------------------
-
+        # Чекаємо завантаження JS
         try:
 
             await page.wait_for_load_state(
@@ -242,158 +404,223 @@ async def check_site():
                 "networkidle не настав."
             )
 
-        # Додатковий час для JavaScript
+        # Невелика додаткова пауза
+        await page.wait_for_timeout(2000)
 
-        await page.wait_for_timeout(3000)
+        # ----------------------------------------------------
+        # ШУКАЄМО SELECT ОБЛАСТІ
+        # ----------------------------------------------------
 
-        # -------------------------------------------------
-        # ОТРИМУЄМО ТЕКСТ
-        # -------------------------------------------------
+        region_select = await find_region_select(page)
 
-        body_text = await page.locator(
-            "body"
-        ).inner_text()
+        if region_select is None:
 
-        body_text_lower = body_text.lower()
-
-        logger.info(
-            "Текст сторінки: %d символів",
-            len(body_text),
-        )
-
-        # -------------------------------------------------
-        # ІНДИКАТОРИ
-        # -------------------------------------------------
-
-        indicators_list = [
-
-            "електронна черга",
-
-            "запис онлайн",
-
-            "оберіть регіон",
-
-            "оберіть область",
-
-            "територіальний підрозділ",
-
-            "дата",
-
-            "час",
-
-        ]
-
-        found = []
-
-        for indicator in indicators_list:
-
-            if indicator in body_text_lower:
-
-                found.append(indicator)
-
-        logger.info(
-            "Знайдені індикатори: %s",
-            found,
-        )
-
-        # -------------------------------------------------
-        # ПЕРЕВІРКА
-        # -------------------------------------------------
-
-        if len(found) >= 2:
-
-            logger.info(
-                "🟢 СЕРВІС ЧЕРГИ ПРАЦЮЄ"
+            logger.warning(
+                "Select області не знайдений."
             )
 
             return {
-                "working": True,
+                "working": False,
                 "status": status,
-                "indicators": found,
-                "error": None,
-            }
-
-        # -------------------------------------------------
-        # ДОДАТКОВА ПЕРЕВІРКА HTML
-        # -------------------------------------------------
-
-        html = await page.content()
-
-        html_lower = html.lower()
-
-        html_indicators = [
-
-            "cherga",
-
-            "dmsu",
-
-            "queue",
-
-            "region",
-
-        ]
-
-        html_found = []
-
-        for indicator in html_indicators:
-
-            if indicator in html_lower:
-
-                html_found.append(indicator)
-
-        logger.info(
-            "HTML індикатори: %s",
-            html_found,
-        )
-
-        if len(html_found) >= 2:
-
-            logger.info(
-                "🟢 Сервіс підтверджено через HTML."
-            )
-
-            return {
-                "working": True,
-                "status": status,
-                "indicators": (
-                    found +
-                    [
-                        f"HTML:{x}"
-                        for x in html_found
-                    ]
+                "region": CHECK_REGION,
+                "departments": [],
+                "error": (
+                    "Не знайдено поле вибору області"
                 ),
-                "error": None,
             }
 
-        # -------------------------------------------------
-        # НЕ ПІДТВЕРДЖЕНО
-        # -------------------------------------------------
-
-        logger.warning(
-            "🔴 Сервіс черги не підтверджено."
+        logger.info(
+            "Select області знайдений."
         )
+
+        # ----------------------------------------------------
+        # ВИБИРАЄМО ОБЛАСТЬ
+        # ----------------------------------------------------
+
+        selected = False
+
+        try:
+
+            await region_select.select_option(
+                label=CHECK_REGION
+            )
+
+            selected = True
+
+            logger.info(
+                "Область вибрана через label: %s",
+                CHECK_REGION,
+            )
+
+        except Exception as e:
+
+            logger.info(
+                "Не вдалося вибрати label: %s",
+                e,
+            )
+
+            # Спроба знайти option вручну
+            try:
+
+                options = await region_select.locator(
+                    "option"
+                ).all()
+
+                for option in options:
+
+                    text = (
+                        await option.inner_text()
+                    ).strip()
+
+                    if CHECK_REGION.lower() in text.lower():
+
+                        value = await option.get_attribute(
+                            "value"
+                        )
+
+                        if value:
+
+                            await region_select.select_option(
+                                value=value
+                            )
+
+                            selected = True
+
+                            logger.info(
+                                "Область вибрана через value: %s",
+                                value,
+                            )
+
+                            break
+
+            except Exception as e2:
+
+                logger.warning(
+                    "Помилка вибору області: %s",
+                    e2,
+                )
+
+        if not selected:
+
+            return {
+                "working": False,
+                "status": status,
+                "region": CHECK_REGION,
+                "departments": [],
+                "error": (
+                    f"Не вдалося вибрати область "
+                    f"«{CHECK_REGION}»"
+                ),
+            }
+
+        # ----------------------------------------------------
+        # ЧЕКАЄМО ОНОВЛЕННЯ ПІДРОЗДІЛІВ
+        # ----------------------------------------------------
+
+        logger.info(
+            "Чекаю завантаження територіальних підрозділів..."
+        )
+
+        department_select = await find_department_select(
+            page
+        )
+
+        if department_select is None:
+
+            logger.warning(
+                "Select територіального підрозділу "
+                "не знайдений."
+            )
+
+            return {
+                "working": False,
+                "status": status,
+                "region": CHECK_REGION,
+                "departments": [],
+                "error": (
+                    "Поле територіального "
+                    "підрозділу не знайдене"
+                ),
+            }
+
+        departments = []
+
+        # Чекаємо максимум 15 секунд
+        for attempt in range(15):
+
+            await page.wait_for_timeout(1000)
+
+            departments = await get_real_options(
+                department_select
+            )
+
+            logger.info(
+                "Спроба %d/15: знайдено підрозділів: %d",
+                attempt + 1,
+                len(departments),
+            )
+
+            if departments:
+                break
+
+        # ----------------------------------------------------
+        # ФІНАЛЬНА ПЕРЕВІРКА
+        # ----------------------------------------------------
+
+        if not departments:
+
+            logger.warning(
+                "🔴 ПІДРОЗДІЛИ НЕ ЗАВАНТАЖИЛИСЯ"
+            )
+
+            return {
+                "working": False,
+                "status": status,
+                "region": CHECK_REGION,
+                "departments": [],
+                "error": (
+                    "Після вибору області "
+                    "територіальні підрозділи "
+                    "не завантажилися"
+                ),
+            }
+
+        logger.info(
+            "🟢 СЕРВІС ПРАЦЮЄ!"
+        )
+
+        logger.info(
+            "Знайдено підрозділів: %d",
+            len(departments),
+        )
+
+        for department in departments[:10]:
+
+            logger.info(
+                "  • %s",
+                department["text"],
+            )
 
         return {
-            "working": False,
+            "working": True,
             "status": status,
-            "indicators": found,
-            "error": (
-                "Не знайдено достатньо "
-                "індикаторів сервісу"
-            ),
+            "region": CHECK_REGION,
+            "departments": departments,
+            "error": None,
         }
 
     except Exception as e:
 
-        logger.warning(
-            "Помилка відкриття сайту: %s",
+        logger.exception(
+            "Помилка перевірки сайту: %s",
             e,
         )
 
         return {
             "working": False,
             "status": None,
-            "indicators": [],
+            "region": CHECK_REGION,
+            "departments": [],
             "error": str(e),
         }
 
@@ -402,9 +629,9 @@ async def check_site():
         await page.close()
 
 
-# =========================================================
-# ФОРМУВАННЯ РЕЗУЛЬТАТУ РУЧНОЇ ПЕРЕВІРКИ
-# =========================================================
+# ============================================================
+# ФОРМУВАННЯ ПОВІДОМЛЕННЯ
+# ============================================================
 
 def format_check_result(result):
 
@@ -412,15 +639,26 @@ def format_check_result(result):
         "%d.%m.%Y %H:%M:%S"
     )
 
-    status = result["status"]
+    status = result.get("status")
+    region = result.get("region")
+    departments = result.get(
+        "departments",
+        []
+    )
 
-    indicators = result["indicators"]
+    # --------------------------------------------------------
+    # ПРАЦЮЄ
+    # --------------------------------------------------------
 
     if result["working"]:
 
         message = (
-            "🟢 <b>ЕЛЕКТРОННА ЧЕРГА ДМСУ ДОСТУПНА</b>\n\n"
-            f"🌐 {SITE_URL}\n"
+            "🟢 <b>ЕЛЕКТРОННА ЧЕРГА ДМСУ ПРАЦЮЄ!</b>\n\n"
+            "Сервіс реально завантажив "
+            "територіальні підрозділи.\n\n"
+            f"🌐 <a href=\"{SITE_URL}\">Відкрити електронну чергу</a>\n"
+            f"📍 Область: <b>{region}</b>\n"
+            f"🏢 Підрозділів: <b>{len(departments)}</b>\n"
             f"🕐 {now}\n"
         )
 
@@ -429,70 +667,62 @@ def format_check_result(result):
             message += (
                 f"📡 HTTP: <code>{status}</code>\n"
             )
+
+        if departments:
+
+            message += "\n<b>Перші доступні підрозділи:</b>\n"
+
+            for department in departments[:10]:
+
+                message += (
+                    f"• {department['text']}\n"
+                )
+
+        return message
+
+    # --------------------------------------------------------
+    # НЕ ПРАЦЮЄ
+    # --------------------------------------------------------
+
+    message = (
+        "🔴 <b>ЕЛЕКТРОННА ЧЕРГА ДМСУ НЕДОСТУПНА</b>\n\n"
+        f"🌐 {SITE_URL}\n"
+        f"📍 Область: <b>{region}</b>\n"
+        f"🕐 {now}\n"
+    )
+
+    if status is not None:
 
         message += (
-            f"🔎 Індикаторів знайдено: "
-            f"<code>{len(indicators)}</code>\n"
+            f"📡 HTTP: <code>{status}</code>\n"
         )
 
-        if indicators:
+    if result.get("error"):
 
-            message += "\n<b>Знайдено:</b>\n"
-
-            for item in indicators:
-
-                message += f"• {item}\n"
-
-        return message
-
-    else:
-
-        message = (
-            "🔴 <b>ЕЛЕКТРОННА ЧЕРГА ДМСУ "
-            "НЕДОСТУПНА</b>\n\n"
-            f"🌐 {SITE_URL}\n"
-            f"🕐 {now}\n"
+        message += (
+            f"⚠️ {result['error']}\n"
         )
 
-        if status is not None:
-
-            message += (
-                f"📡 HTTP: <code>{status}</code>\n"
-            )
-
-        if result["error"]:
-
-            message += (
-                f"⚠️ {result['error']}\n"
-            )
-
-        if indicators:
-
-            message += (
-                "\nЗнайдені індикатори:\n"
-            )
-
-            for item in indicators:
-
-                message += f"• {item}\n"
-
-        return message
+    return message
 
 
-# =========================================================
-# /START
-# =========================================================
+# ============================================================
+# START
+# ============================================================
 
 async def handle_start(chat_id):
 
     message = (
         "🤖 <b>Монітор електронної черги ДМСУ</b>\n\n"
-        "Я автоматично перевіряю доступність "
+        "Я автоматично перевіряю не просто "
+        "завантаження сайту, а реальну роботу "
         "електронної черги.\n\n"
-        f"🌐 {SITE_URL}\n"
-        f"⏱ Перевірка кожні {CHECK_INTERVAL} сек.\n\n"
-        "Натисни кнопку нижче або використай команду:\n"
-        "<code>/check</code>"
+        f"📍 Перевіряється: <b>{CHECK_REGION}</b>\n"
+        f"⏱ Перевірка кожні <b>{CHECK_INTERVAL} сек.</b>\n\n"
+        "Як тільки після вибору області "
+        "з'являться територіальні підрозділи, "
+        "я одразу повідомлю тебе.\n\n"
+        "Також можна виконати ручну перевірку."
     )
 
     await send_telegram(
@@ -502,20 +732,19 @@ async def handle_start(chat_id):
     )
 
 
-# =========================================================
-# /CHECK
-# =========================================================
+# ============================================================
+# РУЧНА ПЕРЕВІРКА
+# ============================================================
 
 async def handle_check(chat_id):
 
     logger.info(
-        "Отримано ручну команду /check"
+        "Отримано ручну перевірку."
     )
 
-    # Повідомляємо, що перевірка почалася
-
     await send_telegram(
-        "🔄 <b>Перевіряю електронну чергу ДМСУ...</b>\n"
+        "🔄 <b>Перевіряю електронну чергу...</b>\n\n"
+        f"📍 Область: {CHECK_REGION}\n"
         "Зачекай кілька секунд.",
         chat_id=chat_id,
     )
@@ -529,9 +758,9 @@ async def handle_check(chat_id):
     )
 
 
-# =========================================================
-# TELEGRAM POLLING
-# =========================================================
+# ============================================================
+# TELEGRAM LISTENER
+# ============================================================
 
 async def telegram_listener():
 
@@ -564,7 +793,8 @@ async def telegram_listener():
                 params = {
                     "timeout": 30,
                     "allowed_updates": [
-                        "message"
+                        "message",
+                        "callback_query",
                     ],
                 }
 
@@ -617,12 +847,63 @@ async def telegram_listener():
                         update["update_id"] + 1
                     )
 
+                    # ----------------------------------------
+                    # CALLBACK BUTTON
+                    # ----------------------------------------
+
+                    callback = update.get(
+                        "callback_query"
+                    )
+
+                    if callback:
+
+                        callback_chat_id = (
+                            callback
+                            .get("message", {})
+                            .get("chat", {})
+                            .get("id")
+                        )
+
+                        callback_id = callback.get(
+                            "id"
+                        )
+
+                        if callback_chat_id:
+
+                            # Підтверджуємо натискання
+                            try:
+
+                                answer_url = (
+                                    f"https://api.telegram.org/"
+                                    f"bot{BOT_TOKEN}/answerCallbackQuery"
+                                )
+
+                                await session.post(
+                                    answer_url,
+                                    json={
+                                        "callback_query_id":
+                                            callback_id
+                                    },
+                                )
+
+                            except Exception:
+                                pass
+
+                            await handle_check(
+                                callback_chat_id
+                            )
+
+                        continue
+
+                    # ----------------------------------------
+                    # MESSAGE
+                    # ----------------------------------------
+
                     message = update.get(
                         "message"
                     )
 
                     if not message:
-
                         continue
 
                     chat = message.get(
@@ -640,17 +921,12 @@ async def telegram_listener():
                     ).strip()
 
                     if not chat_id:
-
                         continue
 
                     logger.info(
-                        "Telegram команда: %s",
+                        "Telegram: %s",
                         text,
                     )
-
-                    # -------------------------------------
-                    # /START
-                    # -------------------------------------
 
                     if text == "/start":
 
@@ -658,24 +934,13 @@ async def telegram_listener():
                             chat_id
                         )
 
-                    # -------------------------------------
-                    # /CHECK
-                    # -------------------------------------
-
                     elif text == "/check":
 
                         await handle_check(
                             chat_id
                         )
 
-                    # -------------------------------------
-                    # КНОПКА
-                    # -------------------------------------
-
-                    elif (
-                        text ==
-                        "🔍 Перевірити зараз"
-                    ):
+                    elif text == "🔍 Перевірити зараз":
 
                         await handle_check(
                             chat_id
@@ -695,9 +960,9 @@ async def telegram_listener():
                 await asyncio.sleep(5)
 
 
-# =========================================================
+# ============================================================
 # АВТОМАТИЧНИЙ МОНІТОРИНГ
-# =========================================================
+# ============================================================
 
 async def automatic_monitor():
 
@@ -713,19 +978,20 @@ async def automatic_monitor():
 
     while True:
 
-        started = asyncio.get_event_loop().time()
+        started = (
+            asyncio.get_event_loop().time()
+        )
 
         try:
 
             result = await check_site()
 
             last_check_result = result
-
             last_check_time = datetime.now()
 
-            # =============================================
-            # САЙТ ПРАЦЮЄ
-            # =============================================
+            # ================================================
+            # СЕРВІС ПРАЦЮЄ
+            # ================================================
 
             if result["working"]:
 
@@ -733,7 +999,7 @@ async def automatic_monitor():
                 fail_count = 0
 
                 logger.info(
-                    "Успішна перевірка: %d/%d",
+                    "🟢 Успішна перевірка %d/%d",
                     success_count,
                     SUCCESS_REQUIRED,
                 )
@@ -743,7 +1009,9 @@ async def automatic_monitor():
                     and current_state is not True
                 ):
 
-                    previous_state = current_state
+                    previous_state = (
+                        current_state
+                    )
 
                     current_state = True
 
@@ -754,11 +1022,16 @@ async def automatic_monitor():
                     if previous_state is False:
 
                         message = (
-                            "🟢 <b>ЕЛЕКТРОННА ЧЕРГА "
-                            "ДМСУ ЗАПРАЦЮВАЛА!</b>\n\n"
-                            f"🌐 {SITE_URL}\n"
+                            "🚨🚨🚨 <b>ЕЛЕКТРОННА ЧЕРГА "
+                            "ДМСУ ЗАПРАЦЮВАЛА!</b> 🚨🚨🚨\n\n"
+                            f"📍 Область: <b>{CHECK_REGION}</b>\n"
+                            f"🏢 Знайдено підрозділів: "
+                            f"<b>{len(result['departments'])}</b>\n"
                             f"🕐 {now}\n\n"
-                            "Сервіс знову доступний."
+                            "🔥 <b>МОЖНА ЗАХОДИТИ І РЕЄСТРУВАТИСЯ!</b>\n\n"
+                            f"👉 <a href=\"{SITE_URL}\">"
+                            "ВІДКРИТИ ЕЛЕКТРОННУ ЧЕРГУ"
+                            "</a>"
                         )
 
                     else:
@@ -766,8 +1039,11 @@ async def automatic_monitor():
                         message = (
                             "🟢 <b>ЕЛЕКТРОННА ЧЕРГА "
                             "ДМСУ ДОСТУПНА</b>\n\n"
-                            f"🌐 {SITE_URL}\n"
-                            f"🕐 {now}"
+                            f"📍 {CHECK_REGION}\n"
+                            f"🕐 {now}\n\n"
+                            f"👉 <a href=\"{SITE_URL}\">"
+                            "Відкрити електронну чергу"
+                            "</a>"
                         )
 
                     await send_telegram(
@@ -775,9 +1051,9 @@ async def automatic_monitor():
                         keyboard=True,
                     )
 
-            # =============================================
-            # САЙТ НЕ ПРАЦЮЄ
-            # =============================================
+            # ================================================
+            # СЕРВІС НЕ ПРАЦЮЄ
+            # ================================================
 
             else:
 
@@ -785,7 +1061,7 @@ async def automatic_monitor():
                 success_count = 0
 
                 logger.info(
-                    "Невдала перевірка: %d/%d",
+                    "🔴 Невдала перевірка %d/%d",
                     fail_count,
                     FAIL_REQUIRED,
                 )
@@ -795,7 +1071,9 @@ async def automatic_monitor():
                     and current_state is not False
                 ):
 
-                    previous_state = current_state
+                    previous_state = (
+                        current_state
+                    )
 
                     current_state = False
 
@@ -803,17 +1081,17 @@ async def automatic_monitor():
                         "%d.%m.%Y %H:%M:%S"
                     )
 
-                    # Не повідомляємо про падіння,
-                    # якщо монітор просто стартував,
-                    # а сайт уже був недоступний.
-
+                    # Повідомляємо про падіння,
+                    # тільки якщо перед цим сайт працював.
                     if previous_state is True:
 
                         message = (
                             "🔴 <b>ЕЛЕКТРОННА ЧЕРГА "
                             "ДМСУ НЕДОСТУПНА</b>\n\n"
-                            f"🌐 {SITE_URL}\n"
+                            f"📍 {CHECK_REGION}\n"
                             f"🕐 {now}\n\n"
+                            "Територіальні підрозділи "
+                            "перестали завантажуватися.\n\n"
                             "Моніторинг продовжується."
                         )
 
@@ -850,38 +1128,53 @@ async def automatic_monitor():
         )
 
 
-# =========================================================
+# ============================================================
 # MAIN
-# =========================================================
+# ============================================================
 
 async def main():
 
     global browser
 
     logger.info("")
-    logger.info("=" * 60)
+    logger.info(
+        "=" * 60
+    )
     logger.info(
         "DMSU QUEUE MONITOR ЗАПУСКАЄТЬСЯ"
     )
-    logger.info("=" * 60)
+    logger.info(
+        "=" * 60
+    )
+
     logger.info(
         "URL: %s",
         SITE_URL,
     )
+
+    logger.info(
+        "Область: %s",
+        CHECK_REGION,
+    )
+
     logger.info(
         "Інтервал: %s сек.",
         CHECK_INTERVAL,
     )
+
     logger.info(
         "Успішних перевірок: %s",
         SUCCESS_REQUIRED,
     )
+
     logger.info(
         "Невдалих перевірок: %s",
         FAIL_REQUIRED,
     )
-    logger.info("=" * 60)
-    logger.info("")
+
+    logger.info(
+        "=" * 60
+    )
 
     async with async_playwright() as p:
 
@@ -890,28 +1183,17 @@ async def main():
             headless=True,
 
             args=[
-
                 "--no-sandbox",
-
                 "--disable-setuid-sandbox",
-
                 "--disable-dev-shm-usage",
-
                 "--disable-gpu",
-
                 "--disable-blink-features=AutomationControlled",
-
             ],
         )
 
         logger.info(
             "Chromium успішно запущений."
         )
-
-        # Запускаємо одночасно:
-        #
-        # 1. Автоматичний моніторинг
-        # 2. Telegram listener
 
         monitor_task = asyncio.create_task(
             automatic_monitor()
@@ -942,9 +1224,9 @@ async def main():
             await browser.close()
 
 
-# =========================================================
-# START
-# =========================================================
+# ============================================================
+# START APPLICATION
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -964,5 +1246,5 @@ if __name__ == "__main__":
 
         logger.exception(
             "Критична помилка: %s",
-            e
+            e,
         )
